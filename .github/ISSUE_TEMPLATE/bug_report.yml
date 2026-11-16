@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a problem with MPD Listening Tools
+labels: ["bug"]
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include steps to reproduce and what you expected.
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it happen?
+      options:
+        - Command line (listening.py)
+        - myMPD picker
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: myMPD, MPD and Python versions
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: Paste any error text from the terminal, the picker or the bridge container log.
+      render: text
+    validations:
+      required: false

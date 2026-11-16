@@ -1,0 +1,12 @@
+services:
+  listening-tools:
+    image: python:3.13-slim
+    network_mode: host
+    user: "${LISTENING_UID:-1000}:${LISTENING_GID:-1000}"
+    restart: unless-stopped
+    volumes:
+      - ./bridge.py:/app/bridge.py:ro
+      - ./services.py:/app/services.py:ro
+      - ./listening.py:/app/listening.py:ro
+      - ./data:/data
+    command: ["python3", "-u", "/app/bridge.py", "--state", "/data"]
