@@ -5,10 +5,13 @@ import json
 import os
 import random
 import socket
+import sys
 import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
+
+import scrobbles
 
 
 class MPD:
@@ -163,8 +166,39 @@ def track_number(value):
     return int(value.split("/", 1)[0]) if value.split("/", 1)[0].isdigit() else 0
 
 
-def albums(mpd, genre, decade, deep):
-    """Group complete local albums, then apply filters at album level."""
+def play_counts(mpd):
+    """MPD playCount stickers by song URI (as myMPD records them)."""
+    counts, uri = {}, None
+    for key, value in mpd.call("sticker", "find", "song", "", "playCount"):
+        if key == "file":
+            uri = value
+        elif key == "sticker" and uri and value.startswith("playCount="):
+            count = value.partition("=")[2]
+            if count.isdecimal():
+                counts[uri] = int(count)
+    return counts
+
+
+def matches(track, genre, decade):
+    """Whether one song passes the genre and decade filters."""
+    if genre and genre.casefold() != track.get("Genre", "").casefold():
+        return False
+    return not decade or (track.get("Date", "")[:4].isdigit()
+                          and int(track["Date"][:4]) // 10 * 10 == decade)
+
+
+def scrobbled(track, played):
+    """Whether a song matches the Last.fm history in played."""
+    return scrobbles.is_played(track.get("Artist") or track.get("AlbumArtist", ""),
+                               track.get("Title", ""), played)
+
+
+def albums(mpd, genre, decade, deep, played=None):
+    """Group complete local albums, then apply filters at album level.
+
+    With played (normalized Last.fm history from scrobbles.played_keys), only
+    albums with no scrobbled track are kept.
+    """
     groups = {}
     for row in records(mpd.call("listallinfo")):
         if row.get("Album") and row.get("duration"):
@@ -176,22 +210,15 @@ def albums(mpd, genre, decade, deep):
                 else Path(row["file"]).parent
             )
             groups.setdefault((artist, row["Album"], identifier), []).append(row)
-    counts = {}
-    if deep:
-        uri = None
-        for key, value in mpd.call("sticker", "find", "song", "", "playCount"):
-            if key == "file":
-                uri = value
-            elif key == "sticker" and uri and value.startswith("playCount="):
-                count = value.partition("=")[2]
-                if count.isdecimal():
-                    counts[uri] = int(count)
+    counts = play_counts(mpd) if deep else {}
     result = []
     for (artist, name, identifier), tracks in groups.items():
         if genre and not any(genre.casefold() == t.get("Genre", "").casefold() for t in tracks):
             continue
         if decade and not any(t.get("Date", "")[:4].isdigit() and
                               int(t["Date"][:4]) // 10 * 10 == decade for t in tracks):
+            continue
+        if played is not None and any(scrobbled(t, played) for t in tracks):
             continue
         tracks.sort(key=lambda t: (track_number(t.get("Disc", "")),
                                    track_number(t.get("Track", "")), t["file"]))
@@ -203,6 +230,68 @@ def albums(mpd, genre, decade, deep):
                        "album": name, "seconds": duration, "uris": uris,
                        "plays": sum(counts.get(uri, 0) for uri in uris) / len(uris)})
     return result
+
+
+def single_tracks(mpd, genre, decade, deep, played):
+    """Local songs that have never been scrobbled, each as its own mix item."""
+    counts = play_counts(mpd) if deep else {}
+    result = []
+    for row in records(mpd.call("listallinfo")):
+        try:
+            seconds = float(row.get("duration", 0))
+        except ValueError:
+            continue
+        if (seconds <= 0 or not row.get("Title") or not matches(row, genre, decade)
+                or scrobbled(row, played)):
+            continue
+        result.append({"id": row["file"], "kind": "track",
+                       "artist": row.get("Artist") or row.get("AlbumArtist", ""),
+                       "title": row["Title"], "album": row.get("Album", ""),
+                       "seconds": seconds, "uris": [row["file"]],
+                       "plays": counts.get(row["file"], 0)})
+    return result
+
+
+def describe(item):
+    """One preview line's text: 'Artist — Album' or 'Artist — Title'."""
+    name = item["title"] if item.get("kind") == "track" else item["album"]
+    return f"{item['artist']} — {name} ({item['seconds']/60:.1f} min)"
+
+
+def history(path, log=print, update=True):
+    """Bring the Last.fm history up to date and return its played_keys().
+
+    Raises ValueError when no complete history exists yet. If the update
+    fails but an earlier history exists, that history is used and a warning
+    is logged. update=False skips the update (another sync is running).
+    """
+    connection = scrobbles.connect(path)
+    try:
+        api_key = os.environ.get("LASTFM_API_KEY", "")
+        user = os.environ.get("LASTFM_USER", "")
+        if not scrobbles.has_history(connection):
+            raise ValueError("No Last.fm history yet. Run the scrobbles sync first.")
+        if update and api_key and user:
+            try:
+                scrobbles.sync(connection, api_key, user)
+            except scrobbles.SyncError as error:
+                log(f"Using the saved history; update failed: {error}")
+        return scrobbles.played_keys(connection)
+    finally:
+        connection.close()
+
+
+def candidates(mpd, genre, decade, deep, unscrobbled, history_path, log=print,
+               update=True):
+    """Mix candidates: albums, or never-scrobbled albums or tracks."""
+    if unscrobbled not in ("", None, "albums", "tracks"):
+        raise ValueError("Unscrobbled must be albums or tracks")
+    if not unscrobbled:
+        return albums(mpd, genre, decade, deep)
+    played = history(history_path, log, update)
+    if unscrobbled == "tracks":
+        return single_tracks(mpd, genre, decade, deep, played)
+    return albums(mpd, genre, decade, deep, played)
 
 
 def mix(candidates, budget, locked, deep):
@@ -249,10 +338,36 @@ def main():
     build.add_argument("--decade", "-d", type=int)
     build.add_argument("--deep-shelf", action="store_true")
     build.add_argument("--lock", "-l", type=int, action="append", default=[])
+    build.add_argument("--unscrobbled", "-u", choices=("albums", "tracks"),
+                       help="only albums or single tracks with no Last.fm scrobble")
+    build.add_argument("--history", type=Path, default=Path("data/scrobbles.db"),
+                       help="Last.fm history database (default: %(default)s)")
     commands.add_parser("queue-mix").add_argument("preview", type=Path)
+    history_cmd = commands.add_parser(
+        "scrobbles", help="download or show the Last.fm history used by --unscrobbled")
+    history_cmd.add_argument("task", choices=("sync", "status"),
+                             help="sync: fetch new scrobbles (needs LASTFM_API_KEY "
+                                  "and LASTFM_USER); status: show what is saved")
+    history_cmd.add_argument("--history", type=Path, default=Path("data/scrobbles.db"),
+                             help="Last.fm history database (default: %(default)s)")
     args = parser.parse_args()
     if not args.operation:
         parser.print_help()
+        return
+    if args.operation == "scrobbles":
+        connection = scrobbles.connect(args.history)
+        try:
+            if args.task == "sync":
+                added = scrobbles.sync(
+                    connection, os.environ.get("LASTFM_API_KEY", ""),
+                    os.environ.get("LASTFM_USER", ""),
+                    progress=lambda page, pages: print(f"Page {page} of {pages}", flush=True))
+                print(f"{added} new scrobbles")
+            print(scrobbles.status(connection))
+        except scrobbles.SyncError as error:
+            parser.exit(1, f"{error}\n")
+        finally:
+            connection.close()
         return
     mpd = None
     try:
@@ -277,13 +392,15 @@ def main():
             if any(not 1 <= n <= len(old) for n in args.lock):
                 raise ValueError("Lock numbers must refer to albums in the existing preview")
             locked = [item for n, item in enumerate(old, 1) if n in args.lock]
-            result = mix(albums(mpd, args.genre, args.decade, args.deep_shelf),
-                         args.minutes * 60, locked, args.deep_shelf)
+            found = candidates(mpd, args.genre, args.decade, args.deep_shelf,
+                               args.unscrobbled, args.history,
+                               log=lambda text: print(text, file=sys.stderr))
+            result = mix(found, args.minutes * 60, locked, args.deep_shelf)
             if not result:
-                raise ValueError("No whole albums fit the time budget and filters")
+                raise ValueError("Nothing fits the time budget and filters")
             write_json(args.preview, {"albums": result}, replace=True)
             for n, item in enumerate(result, 1):
-                print(f"{n}. {item['artist']} — {item['album']} ({item['seconds']/60:.1f} min)")
+                print(f"{n}. {describe(item)}")
             print(f"Total: {sum(item['seconds'] for item in result)/60:.1f} min")
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(1, f"{error}\n")
