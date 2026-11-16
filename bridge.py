@@ -3,12 +3,15 @@
 
 import argparse
 import json
+import os
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import listening
+import scrobbles
 import services
 
 
@@ -54,6 +57,28 @@ class Handler(BaseHTTPRequestHandler):
                 for script, (provider, _) in services.SERVICES.items()
                 if script in installed
             ]}
+        if action == "scrobble-sync":
+            job = self.server.sync_job
+            if job is not None and not job.done():
+                return {"message": self.server.sync_progress}
+            if not (os.environ.get("LASTFM_API_KEY") and os.environ.get("LASTFM_USER")):
+                raise ValueError("Set LASTFM_API_KEY and LASTFM_USER for the bridge")
+            self.server.sync_progress = "Last.fm sync starting"
+            self.server.sync_job = self.server.sync_worker.submit(self.run_sync)
+            return {"message": "Last.fm sync started. Choose Last.fm history again "
+                               "to see progress."}
+        if action == "scrobble-status":
+            job = self.server.sync_job
+            if job is not None and not job.done():
+                return {"message": self.server.sync_progress}
+            connection = scrobbles.connect(root / "scrobbles.db")
+            try:
+                text = scrobbles.status(connection)
+            finally:
+                connection.close()
+            if job is not None and job.exception():
+                text = f"Last sync failed: {job.exception()}. {text}"
+            return {"message": text}
         if action == "choices":
             return services.choices(args["provider"], args.get("album", ""),
                                     int(args.get("offset", 0)))
@@ -91,13 +116,27 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Lock numbers must refer to the current preview")
                     locked = [album for index, album in enumerate(old, 1) if index in locks]
                 deep = args.get("mode") == "deep"
-                candidates = listening.albums(mpd, args.get("genre", "").strip(), decade, deep)
+                syncing = self.server.sync_job is not None and not self.server.sync_job.done()
+                if syncing and args.get("unscrobbled"):
+                    connection = scrobbles.connect(root / "scrobbles.db")
+                    try:
+                        ready = scrobbles.has_history(connection)
+                    finally:
+                        connection.close()
+                    if not ready:
+                        raise ValueError("The first Last.fm sync is still running: "
+                                         + self.server.sync_progress)
+                candidates = listening.candidates(
+                    mpd, args.get("genre", "").strip(), decade, deep,
+                    args.get("unscrobbled", ""), root / "scrobbles.db",
+                    log=lambda text: print(text, file=sys.stderr, flush=True),
+                    update=not syncing)
                 result = listening.mix(candidates, minutes * 60, locked, deep)
                 if not result:
-                    raise ValueError("No albums fit the time budget and filters")
+                    raise ValueError("Nothing fits the time budget and filters")
                 listening.write_json(path, {"albums": result}, replace=True)
                 return {"albums": [
-                    f"{index}. {album['artist']} — {album['album']} ({album['seconds']/60:.1f} min)"
+                    f"{index}. {listening.describe(album)}"
                     for index, album in enumerate(result, 1)
                 ], "minutes": round(sum(album["seconds"] for album in result) / 60, 1)}
             elif action == "replace":
@@ -130,6 +169,23 @@ class Handler(BaseHTTPRequestHandler):
         """Open a connection to the configured MPD partition."""
         return listening.MPD(self.server.host, self.server.port_mpd, self.server.partition)
 
+    def run_sync(self):
+        """Download new Last.fm scrobbles outside the HTTP request."""
+        def progress(page, pages):
+            self.server.sync_progress = f"Last.fm sync: page {page} of {pages}"
+
+        connection = scrobbles.connect(self.server.state / "scrobbles.db")
+        try:
+            added = scrobbles.sync(connection, os.environ["LASTFM_API_KEY"],
+                                   os.environ["LASTFM_USER"], progress=progress)
+            print(f"Last.fm sync finished: {added} new scrobbles", flush=True)
+            return added
+        except scrobbles.SyncError as error:
+            print(f"Last.fm sync failed: {error}", file=sys.stderr, flush=True)
+            raise
+        finally:
+            connection.close()
+
     def run_handoff(self, path, uri):
         """Wait for a song boundary outside the HTTP request."""
         mpd = self.connect()
@@ -156,6 +212,10 @@ def main():
         server.partition = args.partition
         server.worker = ThreadPoolExecutor(max_workers=1)
         server.handoff = None
+        # Separate worker so a long Last.fm sync never delays a radio handoff.
+        server.sync_worker = ThreadPoolExecutor(max_workers=1)
+        server.sync_job = None
+        server.sync_progress = ""
         server.serve_forever()
 
 

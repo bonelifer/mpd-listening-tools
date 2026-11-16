@@ -4,9 +4,14 @@ services:
     network_mode: host
     user: "${LISTENING_UID:-1000}:${LISTENING_GID:-1000}"
     restart: unless-stopped
+    # Optional: LASTFM_API_KEY and LASTFM_USER for never-scrobbled mixes.
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./bridge.py:/app/bridge.py:ro
       - ./services.py:/app/services.py:ro
       - ./listening.py:/app/listening.py:ro
+      - ./scrobbles.py:/app/scrobbles.py:ro
       - ./data:/data
     command: ["python3", "-u", "/app/bridge.py", "--state", "/data"]

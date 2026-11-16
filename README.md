@@ -28,6 +28,31 @@ Deep Shelf favors albums with lower average track play counts. Tracks
 without a play count are treated as unplayed. Queueing appends the preview
 in disc and track order.
 
+## Never-scrobbled music
+
+`--unscrobbled albums` limits a mix to albums where no track has ever been
+scrobbled to Last.fm; `--unscrobbled tracks` builds the mix from single
+tracks you have never scrobbled. Both work with `--genre`, `--decade`,
+`--deep-shelf` and `--lock`.
+
+The history comes from a local copy of your Last.fm scrobbles in
+`data/scrobbles.db`. Download it once, then each mix fetches only the
+scrobbles added since:
+
+```sh
+export LASTFM_API_KEY=your-api-key LASTFM_USER=your-username
+python3 listening.py scrobbles sync
+python3 listening.py mix fresh.json --minutes 90 --unscrobbled tracks
+python3 listening.py scrobbles status
+```
+
+The first download takes about 2.5 seconds per 200 scrobbles (an hour for
+a quarter of a million). If it stops part way, run it again and it carries
+on from the last page it finished. Names are matched without case,
+punctuation, featured artists or version notes such as "(Remastered 2011)"
+or "- Live", so a remaster counts as heard when you scrobbled the original.
+Get an API key at <https://www.last.fm/api/account/create>.
+
 ## myMPD web picker
 
 For myMPD and MPD using host networking, start the loopback bridge and
@@ -41,7 +66,12 @@ python3 install-picker.py --mympd http://127.0.0.1:8081
 
 Open **Listening Tools** from Scripts. You can also add the bundled Home
 launcher by copying `assets/listening-tools.png` into myMPD’s `pics/thumbs/` directory and submitting `home-launcher.json` to its API once. The icon is [CC0](assets/LICENSE.md).
-The UI stores sessions and mix previews in `./data`.
+The UI stores sessions and mix previews in `./data`. For never-scrobbled
+mixes, copy `.env.example` to `.env` (mode 600), fill in your Last.fm API key
+and username, and restart the bridge. Then choose **Last.fm history →
+Download new scrobbles** once; choose it again to see progress. The mix
+builder's last field picks any albums, never-scrobbled albums or
+never-scrobbled tracks.
 
 Check the albums you want to keep before choosing
 **Reroll unlocked albums**. Choose **Append this mix** to queue the
@@ -67,6 +97,7 @@ Contributions are welcome!
 ## Acknowledgments
 
 - Code and documentation assisted by [Codex](https://openai.com/codex/).
+- Never-scrobbled mixes, tests and documentation assisted by [Claude](https://www.anthropic.com/claude).
 
 ## License
 

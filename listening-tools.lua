@@ -96,12 +96,13 @@ if args.commit then
     local result = request({action = args.commit, name = args.name,
         url = args.url, provider = args.provider, item = args.item, album = args.album,
         minutes = args.minutes, decade = args.decade,
-        genre = args.genre, locks = table.concat(locks, " "), mode = args.mode})
+        genre = args.genre, locks = table.concat(locks, " "), mode = args.mode,
+        unscrobbled = args.unscrobbled ~= "any" and args.unscrobbled or ""})
     if result.albums then
         local fields = {
             hidden("name", args.name), hidden("minutes", args.minutes),
             hidden("decade", args.decade), hidden("genre", args.genre),
-            hidden("mode", args.mode)
+            hidden("mode", args.mode), hidden("unscrobbled", args.unscrobbled or "")
         }
         local count = #locks
         for index, album in ipairs(result.albums) do
@@ -111,9 +112,12 @@ if args.commit then
             }
             fields[#fields + 1] = hidden("label_" .. index, album)
         end
+        local tracks = args.unscrobbled == "tracks"
         fields[#fields + 1] = select("commit", {"queue", "confirm-replace", "mix"},
-            {"Append this mix", "Replace queue with this mix", "Reroll unlocked albums"})
-        return ask("Album mix (" .. result.minutes .. " min)", fields)
+            {"Append this mix", "Replace queue with this mix",
+             tracks and "Reroll unlocked tracks" or "Reroll unlocked albums"})
+        return ask((tracks and "Track mix (" or "Album mix (") .. result.minutes .. " min)",
+            fields)
     end
     return result.message
 end
@@ -144,10 +148,16 @@ elseif args.action == "mix" then
     return ask("Build an album mix", {
         field("name"), field("minutes", "120"), field("genre"), field("decade"),
         select("mode", {"regular", "deep"}, {"Fit the time budget", "Deep Shelf"}),
+        select("unscrobbled", {"any", "albums", "tracks"},
+            {"Any albums", "Only never-scrobbled albums", "Only never-scrobbled tracks"}),
         hidden("commit", "mix")
     })
+elseif args.action == "scrobbles" then
+    return ask("Last.fm history", {select("commit", {"scrobble-status", "scrobble-sync"},
+        {"Show what is saved", "Download new scrobbles"})})
 end
 
 return ask("Listening Tools", {select("action",
-    {"save", "resume", "handoff", "handoff-status", "mix"},
-    {"Save session", "Resume session", "Radio handoff", "Handoff status", "Album mix builder"})})
+    {"save", "resume", "handoff", "handoff-status", "mix", "scrobbles"},
+    {"Save session", "Resume session", "Radio handoff", "Handoff status", "Album mix builder",
+     "Last.fm history"})})
